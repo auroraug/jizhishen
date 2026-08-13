@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "providers": [
+    {
+      "id": "cloud_llm",
+      "name": "云端 OpenAI 兼容模型",
+      "kind": "openai",
+      "base_url": "https://example.com/v1",
+      "api_key": "",
+      "enabled": true,
+      "models": ["your-model-name"]
+    },
+    {
+      "id": "mineru_cloud",
+      "name": "MinerU 云端 OCR",
+      "kind": "mineru",
+      "base_url": "https://mineru.net/api/v4",
+      "api_key": "",
+      "enabled": true,
+      "models": ["vlm"]
+    },
+    {
+      "id": "local_llm",
+      "name": "本地 OpenAI 兼容模型",
+      "kind": "openai",
+      "base_url": "http://host.docker.internal:8051/v1",
+      "api_key": "",
+      "enabled": true,
+      "models": ["Qwen3.5-9B-Q4_K_M"]
+    },
+    {
+      "id": "mineru_local",
+      "name": "MinerU 本地 OCR（VLM）",
+      "kind": "mineru-local",
+      "base_url": "http://host.docker.internal:8000",
+      "api_key": "",
+      "enabled": true,
+      "models": ["vlm-engine"]
+    }
+  ],
+  "stage_routes": {
+    "document_classification": {"provider_id": "local_llm", "model": "your-local-model-name"},
+    "general_extraction": {"provider_id": "local_llm", "model": "your-local-model-name"},
+    "payment_extraction": {"provider_id": "local_llm", "model": "your-local-model-name"},
+    "change_extraction": {"provider_id": "local_llm", "model": "your-local-model-name"},
+    "contract_extraction": {"provider_id": "local_llm", "model": "your-local-model-name"},
+    "semantic_consistency": {"provider_id": "cloud_llm", "model": "your-model-name"},
+    "policy_retrieval": {"provider_id": "cloud_llm", "model": "your-model-name"},
+    "text2sql": {"provider_id": "local_llm", "model": "your-local-model-name"},
+    "result_summary": {"provider_id": "cloud_llm", "model": "your-model-name"},
+    "ocr": {"provider_id": "mineru_local", "model": "vlm-engine"}
+  }
+}
