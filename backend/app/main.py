@@ -255,6 +255,7 @@ def delete_project(project_id: str, confirm: str=""):
             conn.execute("DELETE FROM trace_artifacts WHERE run_id=?",(run_id,))
             conn.execute("DELETE FROM run_spans WHERE run_id=?",(run_id,))
             conn.execute("DELETE FROM audit_run_documents WHERE run_id=?",(run_id,))
+        conn.execute("DELETE FROM risk_transitions WHERE project_id=?",(project_id,))
         # Children reference their immutable parent versions. Delete the newest
         # descendants first so a project with re-normalized/MinerU comparison
         # versions can be removed without violating the self foreign key.
@@ -264,7 +265,7 @@ def delete_project(project_id: str, confirm: str=""):
             for table in ("visual_element_analyses","document_chunks","document_elements","document_parse_jobs"):
                 conn.execute(f"DELETE FROM {table} WHERE parser_version_id=?",(version_id,))
             conn.execute("DELETE FROM document_parser_versions WHERE id=?",(version_id,))
-        for table in ("anomalies","audit_runs","timeline","documents"):
+        for table in ("anomalies","audit_runs","review_actions","timeline","documents"):
             conn.execute(f"DELETE FROM {table} WHERE project_id=?",(project_id,))
         conn.execute("DELETE FROM projects WHERE id=?",(project_id,))
     for path in trace_paths:
@@ -1021,18 +1022,27 @@ def _recalculate_project_after_run_delete(conn, project_id: str):
 def trace_delete(run_id: int, confirm: str=""):
     if confirm!=f"run-{run_id}": raise HTTPException(400,f"删除确认值必须为 run-{run_id}")
     with db() as conn:
-        run=conn.execute("SELECT project_id FROM audit_runs WHERE id=?",(run_id,)).fetchone()
+        run=conn.execute("SELECT project_id,action_id FROM audit_runs WHERE id=?",(run_id,)).fetchone()
         if not run: raise HTTPException(404,"运行不存在")
         paths=[Path(r[0]) for r in conn.execute("SELECT file_path FROM trace_artifacts WHERE run_id=? AND file_path IS NOT NULL",(run_id,))]
         conn.execute("UPDATE audit_runs SET parent_run_id=NULL WHERE parent_run_id=?",(run_id,))
+        conn.execute("UPDATE audit_runs SET baseline_run_id=NULL WHERE baseline_run_id=?",(run_id,))
         conn.execute("UPDATE document_parser_versions SET trace_run_id=NULL WHERE trace_run_id=?",(run_id,))
         conn.execute("DELETE FROM audit_run_documents WHERE run_id=?",(run_id,))
+        anomaly_ids=[row[0] for row in conn.execute("SELECT id FROM anomalies WHERE run_id=?",(run_id,))]
+        if anomaly_ids:
+            placeholders=','.join('?' for _ in anomaly_ids)
+            conn.execute(f"UPDATE anomalies SET prior_anomaly_id=NULL WHERE prior_anomaly_id IN ({placeholders})",anomaly_ids)
+            conn.execute(f"UPDATE risk_transitions SET prior_anomaly_id=NULL WHERE prior_anomaly_id IN ({placeholders})",anomaly_ids)
+            conn.execute(f"UPDATE risk_transitions SET current_anomaly_id=NULL WHERE current_anomaly_id IN ({placeholders})",anomaly_ids)
+        conn.execute("DELETE FROM risk_transitions WHERE run_id=?",(run_id,))
         for table in ("audit_events","ai_calls","extracted_facts","anomalies"):
             conn.execute(f"DELETE FROM {table} WHERE run_id=?",(run_id,))
         conn.execute("UPDATE run_spans SET input_artifact_id=NULL,output_artifact_id=NULL,error_artifact_id=NULL WHERE run_id=?",(run_id,))
         conn.execute("DELETE FROM trace_artifacts WHERE run_id=?",(run_id,))
         conn.execute("DELETE FROM run_spans WHERE run_id=?",(run_id,))
         conn.execute("DELETE FROM audit_runs WHERE id=?",(run_id,))
+        if run["action_id"]: conn.execute("DELETE FROM review_actions WHERE id=?",(run["action_id"],))
         reverted_to=_recalculate_project_after_run_delete(conn,run["project_id"])
     for path in paths:
         if path.exists(): path.unlink()

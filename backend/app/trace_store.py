@@ -145,7 +145,8 @@ def run_trace(run_id: int, include_content: bool = True) -> dict[str, Any]:
     else:
         artifacts = [{k: v for k, v in row.items() if k not in {"inline_json", "file_path"}} | {"stored": "inline" if row.get("inline_json") is not None else "gzip"} for row in artifacts]
     run_item = dict(run)
-    for field in ("result_json", "config_snapshot_json", "prompt_versions_json", "route_overrides_json"):
+    for field in ("result_json", "config_snapshot_json", "prompt_versions_json", "route_overrides_json",
+                  "action_snapshot_json", "decision_json"):
         try:
             run_item[field.removesuffix("_json")] = json.loads(run_item.pop(field) or "{}")
         except Exception:
