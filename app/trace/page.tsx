@@ -284,7 +284,7 @@ export default function TraceConsole() {
                       {trace.run.id}
                     </p>
                     <h1>
-                      {trace.run.status} · {trace.run.current_stage}
+                      {trace.run.status} · {trace.run.current_stage} · {trace.run.review_mode==='gate'?'阶段门禁':trace.run.review_mode==='incremental'?'资料增量':trace.run.review_mode==='final'?'全量终审':'历史运行'}
                     </h1>
                     <small>
                       Prompt
@@ -321,6 +321,7 @@ export default function TraceConsole() {
                     <b>{trace.run.anomaly_count}</b>
                   </span>
                 </section>
+                {trace.run.action_snapshot_json?.action_type&&<section className="trace-action-snapshot"><div><small>待审业务动作</small><b>{trace.run.action_snapshot_json.action_label}</b><span>{trace.run.action_snapshot_json.title}</span></div><div><small>资料时间边界</small><b>{trace.run.cutoff_at||'—'}</b><span>基线 Run {trace.run.baseline_run_id||'首个基线'}</span></div><div><small>本批资料</small><b>{trace.run.action_snapshot_json.current_document_ids?.length||0} 份</b><span>后续资料不会倒灌</span></div><div><small>门禁结论</small><b>{trace.run.decision_json?.recommendation||'运行中'}</b><span>新增 {trace.run.decision_json?.risk_transitions?.new||0} · 持续 {trace.run.decision_json?.risk_transitions?.ongoing||0} · 解除 {trace.run.decision_json?.risk_transitions?.resolved||0}</span></div></section>}
                 <div className="span-workspace">
                   <section className="span-list">
                     <h2>执行顺序</h2>

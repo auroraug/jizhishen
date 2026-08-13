@@ -85,9 +85,16 @@ CREATE TABLE IF NOT EXISTS audit_runs (
   fact_count INTEGER NOT NULL, anomaly_count INTEGER NOT NULL DEFAULT 0, provider TEXT NOT NULL,
   progress INTEGER NOT NULL DEFAULT 0, current_stage TEXT, error TEXT, result_json TEXT NOT NULL DEFAULT '{}'
 );
+CREATE TABLE IF NOT EXISTS review_actions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL REFERENCES projects(id),
+  project_action_no INTEGER, action_type TEXT NOT NULL, title TEXT NOT NULL,
+  planned_at TEXT, cutoff_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'under_review',
+  current_document_ids_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS audit_run_documents (
   run_id INTEGER NOT NULL REFERENCES audit_runs(id), document_id INTEGER NOT NULL REFERENCES documents(id),
   parser_version_id INTEGER NOT NULL REFERENCES document_parser_versions(id), is_override INTEGER NOT NULL DEFAULT 0,
+  document_role TEXT NOT NULL DEFAULT 'history',
   PRIMARY KEY(run_id,document_id)
 );
 CREATE TABLE IF NOT EXISTS extracted_facts (
@@ -117,7 +124,15 @@ CREATE TABLE IF NOT EXISTS rule_definitions (
   code TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL,
   fields TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '',
   severity TEXT NOT NULL DEFAULT 'medium', enabled INTEGER NOT NULL DEFAULT 1,
-  system_managed INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  system_managed INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  applicable_actions_json TEXT NOT NULL DEFAULT '["*"]', blocking INTEGER NOT NULL DEFAULT 0,
+  insufficient_behavior TEXT NOT NULL DEFAULT 'manual_review'
+);
+CREATE TABLE IF NOT EXISTS risk_transitions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL REFERENCES audit_runs(id),
+  project_id TEXT NOT NULL REFERENCES projects(id), risk_key TEXT NOT NULL, code TEXT NOT NULL,
+  transition TEXT NOT NULL, prior_anomaly_id INTEGER, current_anomaly_id INTEGER,
+  created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS prompt_versions (
@@ -158,6 +173,8 @@ CREATE INDEX IF NOT EXISTS idx_parse_jobs_status ON document_parse_jobs(status,u
 CREATE INDEX IF NOT EXISTS idx_elements_version_page ON document_elements(parser_version_id,page,reading_order);
 CREATE INDEX IF NOT EXISTS idx_chunks_version ON document_chunks(parser_version_id,id);
 CREATE INDEX IF NOT EXISTS idx_run_documents_run ON audit_run_documents(run_id);
+CREATE INDEX IF NOT EXISTS idx_review_actions_project ON review_actions(project_id,id DESC);
+CREATE INDEX IF NOT EXISTS idx_risk_transitions_run ON risk_transitions(run_id,id);
 CREATE INDEX IF NOT EXISTS idx_parser_version_deletions_document ON parser_version_deletions(document_id,deleted_at DESC);
 """
 
@@ -220,12 +237,35 @@ def init_db():
             "run_kind":"TEXT NOT NULL DEFAULT 'audit'",
             "config_snapshot_json":"TEXT NOT NULL DEFAULT '{}'",
             "prompt_versions_json":"TEXT NOT NULL DEFAULT '{}'",
-            "route_overrides_json":"TEXT NOT NULL DEFAULT '{}'"
+            "route_overrides_json":"TEXT NOT NULL DEFAULT '{}'",
+            "action_id":"INTEGER REFERENCES review_actions(id)",
+            "review_mode":"TEXT NOT NULL DEFAULT 'final'",
+            "cutoff_at":"TEXT",
+            "baseline_run_id":"INTEGER REFERENCES audit_runs(id)",
+            "action_snapshot_json":"TEXT NOT NULL DEFAULT '{}'",
+            "decision_json":"TEXT NOT NULL DEFAULT '{}'"
         }.items():
             if name not in run_columns:
                 conn.execute(f"ALTER TABLE audit_runs ADD COLUMN {name} {ddl}")
         if "project_run_no" not in run_columns:
             conn.execute("ALTER TABLE audit_runs ADD COLUMN project_run_no INTEGER")
+        run_document_columns={r[1] for r in conn.execute("PRAGMA table_info(audit_run_documents)")}
+        if "document_role" not in run_document_columns:
+            conn.execute("ALTER TABLE audit_run_documents ADD COLUMN document_role TEXT NOT NULL DEFAULT 'history'")
+        rule_columns={r[1] for r in conn.execute("PRAGMA table_info(rule_definitions)")}
+        for name,ddl in {
+            "applicable_actions_json":"TEXT NOT NULL DEFAULT '[\"*\"]'",
+            "blocking":"INTEGER NOT NULL DEFAULT 0",
+            "insufficient_behavior":"TEXT NOT NULL DEFAULT 'manual_review'"
+        }.items():
+            if name not in rule_columns: conn.execute(f"ALTER TABLE rule_definitions ADD COLUMN {name} {ddl}")
+        anomaly_columns={r[1] for r in conn.execute("PRAGMA table_info(anomalies)")}
+        for name,ddl in {
+            "risk_key":"TEXT",
+            "lifecycle_status":"TEXT NOT NULL DEFAULT 'new'",
+            "prior_anomaly_id":"INTEGER REFERENCES anomalies(id)"
+        }.items():
+            if name not in anomaly_columns: conn.execute(f"ALTER TABLE anomalies ADD COLUMN {name} {ddl}")
         parser_columns={r[1] for r in conn.execute("PRAGMA table_info(document_parser_versions)")}
         if "document_version_no" not in parser_columns:
             conn.execute("ALTER TABLE document_parser_versions ADD COLUMN document_version_no INTEGER")
@@ -248,6 +288,11 @@ def init_db():
           WHEN NEW.document_version_no IS NULL BEGIN
             UPDATE document_parser_versions SET document_version_no=(SELECT COALESCE(MAX(document_version_no),0)+1
               FROM document_parser_versions WHERE document_id=NEW.document_id AND id<>NEW.id) WHERE id=NEW.id;
+          END;
+          CREATE TRIGGER IF NOT EXISTS trg_review_action_project_no AFTER INSERT ON review_actions
+          WHEN NEW.project_action_no IS NULL BEGIN
+            UPDATE review_actions SET project_action_no=(SELECT COALESCE(MAX(project_action_no),0)+1
+              FROM review_actions WHERE project_id=NEW.project_id AND id<>NEW.id) WHERE id=NEW.id;
           END;
         """)
         # One-time removal of seeded findings: after this marker every finding must
@@ -280,6 +325,24 @@ def init_db():
               (code,name,kind,fields,description,severity,enabled,system_managed,created_at,updated_at)
               VALUES(?,?,?,?,?,?,1,1,?,?)""",[(*r,created,created) for r in rules])
             conn.execute("INSERT INTO app_meta(key,value) VALUES('rule_catalog_v1','seeded')")
+        if not conn.execute("SELECT 1 FROM app_meta WHERE key='action_rule_scope_v1'").fetchone():
+            scopes={
+              "DOC-001":list(("project_approval","tender_release","contract_signing","change_approval",
+                              "measurement_confirmation","payment_approval","acceptance_approval",
+                              "settlement_payment","document_increment","final_review")),
+              "AMT-001":["contract_signing","final_review"],
+              "TERM-001":["contract_signing","final_review"],
+              "PAY-001":["payment_approval","settlement_payment","final_review"],
+              "CHG-001":["change_approval","measurement_confirmation","payment_approval","settlement_payment","final_review"],
+              "SEQ-001":["change_approval","measurement_confirmation","payment_approval","final_review"],
+              "ATT-001":["change_approval","measurement_confirmation","payment_approval","final_review"],
+              "SEM-001":["contract_signing","change_approval","measurement_confirmation","payment_approval","final_review"]
+            }
+            blocking={"DOC-001","AMT-001","PAY-001","SEQ-001"}
+            for code,actions in scopes.items():
+                conn.execute("UPDATE rule_definitions SET applicable_actions_json=?,blocking=? WHERE code=?",
+                             (json.dumps(actions,ensure_ascii=False),int(code in blocking),code))
+            conn.execute("INSERT INTO app_meta(key,value) VALUES('action_rule_scope_v1','seeded')")
         # Date ordering is deterministic business logic. Migrate legacy user
         # semantic rules that explicitly describe a date relationship so future
         # runs compare source dates in Python instead of asking an LLM to count.

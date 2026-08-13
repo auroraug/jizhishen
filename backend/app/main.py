@@ -32,6 +32,7 @@ from .prompt_store import create_draft, list_prompts, prompt_snapshot, publish, 
 from .trace_store import attach_input, finish_span, load_artifact, run_trace, skipped_span, start_span
 from .parser_service import (NORMALIZER_VERSION, PYMUPDF_VERSION, activate_version, create_renormalized_version, create_version, ensure_legacy_version,
     poll_mineru_batch, poll_mineru_local_task, run_pymupdf_version, run_renormalized_version, version_payload)
+from .review_actions import ACTION_TYPES, REVIEW_MODES, action_definition, normalized_action, parse_cutoff
 
 app=FastAPI(title="集智审 API",version="1.0.0-mvp",docs_url="/api/docs",openapi_url="/api/openapi.json")
 app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_methods=["*"],allow_headers=["*"])
@@ -316,19 +317,58 @@ class AuditStart(BaseModel):
     derived_from_stage: str | None = None
     run_kind: str = "audit"
     parser_versions: dict[str, int] | None = None
+    review_mode: str = "final"
+    action_type: str | None = None
+    action_title: str | None = None
+    planned_at: str | None = None
+    cutoff_at: str | None = None
+    current_document_ids: list[int] | None = None
+
+
+@app.get("/api/review-actions/catalog")
+def review_action_catalog():
+    return {"modes": [
+        {"value": "gate", "label": "阶段门禁审查", "description": "在付款、变更、验收等动作批准前给出放行建议"},
+        {"value": "incremental", "label": "新增资料增量审查", "description": "只把本批资料作为变化输入，并结合截止时点的历史证据"},
+        {"value": "final", "label": "全过程全量终审", "description": "竣工结算、年度内控或历史项目审计"},
+    ], "actions": [{"value": key, **value} for key, value in ACTION_TYPES.items()]}
+
+
+@app.get("/api/projects/{project_id}/review-actions")
+def project_review_actions(project_id: str):
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone():
+            raise HTTPException(404, "项目不存在")
+        items=[]
+        for row in conn.execute("""SELECT a.*,r.id AS run_id,r.status AS run_status,r.decision_json
+          FROM review_actions a LEFT JOIN audit_runs r ON r.action_id=a.id
+          WHERE a.project_id=? ORDER BY a.id DESC""", (project_id,)):
+            item=decode(row,"current_document_ids_json","decision_json")
+            items.append(item)
+    return {"items":items,"total":len(items)}
 
 
 @app.post("/api/projects/{project_id}/audit",status_code=202)
 def run_audit(project_id: str, background_tasks: BackgroundTasks, body: AuditStart | None = None):
     body = body or AuditStart()
     body.route_overrides = body.route_overrides or {}
+    try:
+        review_mode,action_type=normalized_action(body.review_mode,body.action_type)
+        cutoff_at=parse_cutoff(body.cutoff_at)
+    except ValueError as exc:
+        raise HTTPException(400,str(exc))
+    current_document_ids={int(value) for value in (body.current_document_ids or [])}
+    if review_mode in {"gate","incremental"} and not current_document_ids:
+        raise HTTPException(400,"阶段门禁或增量审查至少选择一份本批资料")
     invalid = set(body.route_overrides) - set(ALL_STAGES)
     if invalid: raise HTTPException(400,f"未知阶段：{', '.join(sorted(invalid))}")
     config_snapshot = snapshot(body.route_overrides)
     prompts = prompt_snapshot()
     route_label = ",".join(sorted({f"{v.get('provider_id')}:{v.get('model')}" for v in config_snapshot["stage_routes"].values()}))
     with db() as conn:
-        document_ids=[row["id"] for row in conn.execute("SELECT id FROM documents WHERE project_id=? AND deleted_at IS NULL",(project_id,))]
+        document_ids=[row["id"] for row in conn.execute("SELECT id FROM documents WHERE project_id=? AND deleted_at IS NULL AND created_at<=?",(project_id,cutoff_at))]
+    invalid_current=current_document_ids-set(document_ids)
+    if invalid_current: raise HTTPException(400,"本批资料包含不属于当前项目或晚于截止时间的文档")
     for document_id in document_ids:
         try: ensure_legacy_version(document_id)
         except Exception: pass
@@ -336,30 +376,45 @@ def run_audit(project_id: str, background_tasks: BackgroundTasks, body: AuditSta
         if not conn.execute("SELECT 1 FROM projects WHERE id=?",(project_id,)).fetchone(): raise HTTPException(404,"项目不存在")
         running=conn.execute("SELECT id FROM audit_runs WHERE project_id=? AND run_kind='audit' AND status IN ('queued','running') ORDER BY id DESC LIMIT 1",(project_id,)).fetchone()
         if running: return {"ok":True,"run_id":running["id"],"status":"running"}
+        baseline=conn.execute("SELECT id FROM audit_runs WHERE project_id=? AND status='completed' AND run_kind='audit' ORDER BY id DESC LIMIT 1",(project_id,)).fetchone()
         selected_versions=[];overrides=body.parser_versions or {}
-        for document in conn.execute("SELECT id,name,active_parser_version_id FROM documents WHERE project_id=? AND deleted_at IS NULL ORDER BY id",(project_id,)):
+        for document in conn.execute("SELECT id,name,active_parser_version_id FROM documents WHERE project_id=? AND deleted_at IS NULL AND created_at<=? ORDER BY id",(project_id,cutoff_at)):
             version_id=int(overrides.get(str(document["id"])) or document["active_parser_version_id"] or 0)
             version=conn.execute("SELECT id,status FROM document_parser_versions WHERE id=? AND document_id=?",(version_id,document["id"])).fetchone()
             if not version or version["status"] not in {"ready","ready_with_warnings"}:
                 raise HTTPException(409,f"资料“{document['name']}”尚未选择可用的 active 解析版本")
-            selected_versions.append((document["id"],version_id,1 if str(document["id"]) in overrides else 0))
+            selected_versions.append((document["id"],version_id,1 if str(document["id"]) in overrides else 0,
+                                      "current" if document["id"] in current_document_ids else "history"))
         if not selected_versions: raise HTTPException(409,"项目没有可审查资料")
         started=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        definition=action_definition(action_type)
+        title=(body.action_title or definition["label"]).strip()
+        action_snapshot={"review_mode":review_mode,"action_type":action_type,"action_label":definition["label"],
+                         "title":title,"planned_at":body.planned_at,"cutoff_at":cutoff_at,
+                         "required_phases":definition["required_phases"],"current_document_ids":sorted(current_document_ids)}
+        action_cur=conn.execute("""INSERT INTO review_actions(project_id,action_type,title,planned_at,cutoff_at,status,current_document_ids_json,created_at,updated_at)
+          VALUES(?,?,?,?,?,'under_review',?,?,?)""",(project_id,action_type,title,body.planned_at,cutoff_at,
+          json.dumps(sorted(current_document_ids)),started,started))
+        action_id=action_cur.lastrowid
         cur=conn.execute("""INSERT INTO audit_runs(project_id,started_at,status,rule_count,fact_count,anomaly_count,provider,progress,current_stage,result_json,
-          parent_run_id,derived_from_stage,run_kind,config_snapshot_json,prompt_versions_json,route_overrides_json)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(project_id,started,"running",0,0,0,route_label,0,"queued","{}",
+          parent_run_id,derived_from_stage,run_kind,config_snapshot_json,prompt_versions_json,route_overrides_json,
+          action_id,review_mode,cutoff_at,baseline_run_id,action_snapshot_json,decision_json)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(project_id,started,"running",0,0,0,route_label,0,"queued","{}",
           body.parent_run_id,body.derived_from_stage,body.run_kind,json.dumps(config_snapshot,ensure_ascii=False),
-          json.dumps(prompts,ensure_ascii=False),json.dumps(body.route_overrides,ensure_ascii=False)))
+          json.dumps(prompts,ensure_ascii=False),json.dumps(body.route_overrides,ensure_ascii=False),action_id,review_mode,cutoff_at,
+          baseline["id"] if baseline else None,json.dumps(action_snapshot,ensure_ascii=False),"{}"))
         run_id=cur.lastrowid
-        conn.executemany("INSERT INTO audit_run_documents(run_id,document_id,parser_version_id,is_override) VALUES(?,?,?,?)",[(run_id,*item) for item in selected_versions])
-        conn.execute("INSERT INTO audit_events(run_id,sequence,created_at,stage,status,message,detail_json) VALUES(?,?,?,?,?,?,?)",(run_id,1,started,"queued","completed","审查任务已创建，等待读取资料","{}"))
+        conn.executemany("INSERT INTO audit_run_documents(run_id,document_id,parser_version_id,is_override,document_role) VALUES(?,?,?,?,?)",[(run_id,*item) for item in selected_versions])
+        conn.execute("INSERT INTO audit_events(run_id,sequence,created_at,stage,status,message,detail_json) VALUES(?,?,?,?,?,?,?)",
+                     (run_id,1,started,"queued","completed",f"{definition['label']}任务已创建，资料截止 {cutoff_at}",json.dumps(action_snapshot,ensure_ascii=False)))
     background_tasks.add_task(execute_audit,run_id,project_id)
     return {"ok":True,"run_id":run_id,"status":"running","poll_url":f"/api/audit-runs/{run_id}"}
 
 def audit_run_payload(conn, run_id):
     run=conn.execute("SELECT * FROM audit_runs WHERE id=?",(run_id,)).fetchone()
     if not run: raise HTTPException(404,"审查运行不存在")
-    item=decode(run,"result_json","config_snapshot_json","prompt_versions_json","route_overrides_json")
+    item=decode(run,"result_json","config_snapshot_json","prompt_versions_json","route_overrides_json",
+                "action_snapshot_json","decision_json")
     events=[decode(row,"detail_json") for row in conn.execute("SELECT * FROM audit_events WHERE run_id=? ORDER BY sequence",(run_id,))]
     calls=rows(conn.execute("SELECT id,stage,provider,model,started_at,duration_ms,success,input_tokens,output_tokens,request_hash,response_preview,error FROM ai_calls WHERE run_id=? ORDER BY id",(run_id,)).fetchall())
     spans=[decode(row,"metadata_json") for row in conn.execute("SELECT * FROM run_spans WHERE run_id=? ORDER BY sequence",(run_id,))]
@@ -369,7 +424,9 @@ def audit_run_payload(conn, run_id):
     anomalies=[]
     for row in conn.execute("SELECT * FROM anomalies WHERE run_id=? ORDER BY CASE severity WHEN 'high' THEN 0 WHEN 'moderate' THEN 1 WHEN 'minor' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END,id",(run_id,)):
         a=decode(row,"evidence_json"); a["evidences"]=a.pop("evidence_json"); anomalies.append(a)
-    return {"run":item,"events":events,"calls":calls,"spans":spans,"facts":facts,"anomalies":anomalies}
+    transitions=rows(conn.execute("SELECT * FROM risk_transitions WHERE run_id=? ORDER BY id",(run_id,)).fetchall())
+    return {"run":item,"events":events,"calls":calls,"spans":spans,"facts":facts,"anomalies":anomalies,
+            "risk_transitions":transitions}
 
 @app.get("/api/audit-runs/{run_id}")
 def audit_run(run_id: int):

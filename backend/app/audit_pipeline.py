@@ -22,6 +22,7 @@ from .providers import chat_with_trace, mineru_batch_result
 from .model_config import resolve_route
 from .prompt_store import published_prompt, render
 from .trace_store import attach_input, finish_span, skipped_span, start_span
+from .review_actions import applicable_rule
 
 
 STAGES = {"queued": 0, "ocr": 5, "documents": 10, "document_classification": 16,
@@ -656,9 +657,12 @@ def payment_limit(contract_value,change_total,settlement,terms,has_acceptance):
 async def execute(run_id, project_id):
     try:
         with db() as conn:
-            run_row = conn.execute("SELECT route_overrides_json FROM audit_runs WHERE id=?", (run_id,)).fetchone()
-            active_rules = {row["code"]: dict(row) for row in conn.execute(
+            run_row = dict(conn.execute("SELECT * FROM audit_runs WHERE id=?", (run_id,)).fetchone())
+            action_snapshot=json.loads(run_row.get("action_snapshot_json") or "{}")
+            action_type=action_snapshot.get("action_type") or "final_review"
+            all_active_rules = {row["code"]: dict(row) for row in conn.execute(
                 "SELECT * FROM rule_definitions WHERE enabled=1 ORDER BY code")}
+            active_rules={code:rule for code,rule in all_active_rules.items() if applicable_rule(rule,action_type)}
         executable_rules = list(active_rules.values())
         def rule_enabled(code):
             return code in active_rules
@@ -666,12 +670,12 @@ async def execute(run_id, project_id):
             value = active_rules.get(code, {}).get("severity", fallback)
             return value if value in SEVERITIES else fallback
         route_overrides = json.loads((run_row or {"route_overrides_json": "{}"})["route_overrides_json"] or "{}")
-        event(run_id, "documents", "running", "读取项目原件，建立页码、版面块和坐标索引")
+        event(run_id, "documents", "running", f"读取资料截止时点快照并建立坐标索引（{action_snapshot.get('action_label','全过程全量终审')}）")
         documents_span = start_span(run_id, "documents", "stage", "读取原件并建立版面索引")
         with db() as conn:
             project = dict(conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone())
             docs = []
-            selected=list(conn.execute("""SELECT d.*,v.id AS selected_parser_version_id,v.parser_kind,v.parser_name,v.parser_version,
+            selected=list(conn.execute("""SELECT d.*,rd.document_role,v.id AS selected_parser_version_id,v.parser_kind,v.parser_name,v.parser_version,
               v.model AS parser_model,v.status AS parser_status,v.content_json AS parser_content_json,v.manifest_json AS parser_manifest_json,v.stats_json AS parser_stats_json
               FROM audit_run_documents rd JOIN documents d ON d.id=rd.document_id JOIN document_parser_versions v ON v.id=rd.parser_version_id
               WHERE rd.run_id=? ORDER BY d.id""",(run_id,)))
@@ -691,6 +695,8 @@ async def execute(run_id, project_id):
                 item["canonical_phase"] = canonical_phase(item)
                 docs.append(item)
         usable = [d for d in docs if d.get("text")]
+        reuse_baseline=bool(run_row.get("baseline_run_id") and run_row.get("review_mode") in {"gate","incremental"})
+        processing_docs=[d for d in usable if d.get("document_role")=="current"] if reuse_baseline else usable
         event(run_id, "documents", "completed", f"共读取 {len(docs)} 份资料，其中 {len(usable)} 份可进入文本审查",
               {"document_count": len(docs), "usable_count": len(usable),
                "phases": {d["name"]: d["canonical_phase"] for d in docs}})
@@ -708,7 +714,7 @@ async def execute(run_id, project_id):
         event(run_id, "document_classification", "running", "使用已发布 Prompt 对资料阶段进行语义分类")
         classification_span = start_span(run_id, "document_classification", "stage", "资料分类")
         classification_input = [{"document_id": d["id"], "name": d["name"], "declared_type": d["doc_type"],
-                                 "excerpt": plain_text(d["text"])[:1800]} for d in usable]
+                                 "excerpt": plain_text(d["text"])[:1800]} for d in processing_docs]
         try:
             classification_variables={"phases": list(CANONICAL_PHASES) + ["其他资料"], "documents": classification_input}
             classified = await model_json(run_id, "document_classification", [
@@ -720,14 +726,14 @@ async def execute(run_id, project_id):
             allowed_phases = set(CANONICAL_PHASES) | {"其他资料"}
             classified_map = {int(x.get("document_id") or 0): x.get("phase") for x in classified.get("documents", [])
                               if x.get("phase") in allowed_phases}
-            for document in usable:
+            for document in processing_docs:
                 document["canonical_phase"] = classified_map.get(document["id"], document["canonical_phase"])
             finish_span(classification_span, output={"classifications": [{"document_id": d["id"],
-                "name": d["name"], "phase": d["canonical_phase"]} for d in usable]})
-            event(run_id, "document_classification", "completed", f"已分类 {len(usable)} 份资料")
+                "name": d["name"], "phase": d["canonical_phase"]} for d in processing_docs]})
+            event(run_id, "document_classification", "completed", f"已分类本次需处理的 {len(processing_docs)} 份资料")
         except Exception as exc:
             finish_span(classification_span, "completed_with_warning", output={"classifications": [{"document_id": d["id"],
-                "name": d["name"], "phase": d["canonical_phase"], "source": "deterministic"} for d in usable]},
+                "name": d["name"], "phase": d["canonical_phase"], "source": "deterministic"} for d in processing_docs]},
                 error={"message": str(exc), "fallback": "deterministic document mapping"})
             event(run_id, "document_classification", "completed", "模型分类失败，已明确记录并使用确定性文件映射继续",
                   {"error": str(exc)[:180], "fallback": "deterministic"})
@@ -735,10 +741,10 @@ async def execute(run_id, project_id):
         llm_facts, parser_facts = [], []
         doc_ids = {d["id"] for d in docs}
         extraction_plan = [
-            ("general_extraction", usable),
-            ("payment_extraction", [d for d in usable if d["canonical_phase"] in {"结算付款", "竣工验收", "开工计量"}]),
-            ("change_extraction", [d for d in usable if d["canonical_phase"] == "变更签证"]),
-            ("contract_extraction", [d for d in usable if d["canonical_phase"] == "施工合同"]),
+            ("general_extraction", processing_docs),
+            ("payment_extraction", [d for d in processing_docs if d["canonical_phase"] in {"结算付款", "竣工验收", "开工计量"}]),
+            ("change_extraction", [d for d in processing_docs if d["canonical_phase"] == "变更签证"]),
+            ("contract_extraction", [d for d in processing_docs if d["canonical_phase"] == "施工合同"]),
         ]
         for stage, stage_docs in extraction_plan:
             prompt = published_prompt(stage)
@@ -779,11 +785,25 @@ async def execute(run_id, project_id):
         attach_input(parser_span, {"documents": [{"id":d["id"],"name":d["name"],"parser_version_id":d["selected_parser_version_id"],
             "elements":[{"element_id":x["element_id"],"page":x["page"],"type":x["element_type"],"bbox":x.get("bbox_json"),
                          "markdown":x.get("markdown"),"cell_grid":x.get("cell_grid_json")} for x in d["elements"]],
-            "chunks":[{"chunk_id":x["chunk_id"],"element_ids":x.get("element_ids_json"),"pages":[x["page_from"],x["page_to"]],"content":x["content"]} for x in d["chunks"]]} for d in usable]})
-        for document in usable:
+            "chunks":[{"chunk_id":x["chunk_id"],"element_ids":x.get("element_ids_json"),"pages":[x["page_from"],x["page_to"]],"content":x["content"]} for x in d["chunks"]]} for d in processing_docs]})
+        for document in processing_docs:
             parser_facts.extend(deterministic_extract(document))
         finish_span(parser_span, output={"facts": parser_facts})
         facts = merge_facts(llm_facts, parser_facts)
+        baseline_fact_rows=[]
+        if reuse_baseline:
+            with db() as conn:
+                baseline_fact_rows=list(conn.execute("SELECT * FROM extracted_facts WHERE run_id=? ORDER BY id",(run_row["baseline_run_id"],)))
+            current_doc_ids={d["id"] for d in processing_docs}
+            for row in baseline_fact_rows:
+                if row["document_id"] in current_doc_ids:continue
+                facts.append({"field":row["field_name"],"value":json.loads(row["value_json"]),"confidence":row["confidence"],
+                              "document_id":row["document_id"],"parser_version_id":row["parser_version_id"],
+                              "element_ids":json.loads(row["element_ids_json"] or "[]"),"page":row["page"],
+                              "block":row["block_id"],"quote":row["quote"],"origin":"baseline-reuse",
+                              "provider":row["provider"],"model":row["model"],"source_stage":"baseline_reuse"})
+            event(run_id,"fact_persistence","running",f"复用基线 Run #{run_row['baseline_run_id']} 的历史事实，仅重抽取本批 {len(processing_docs)} 份资料",
+                  {"baseline_run_id":run_row["baseline_run_id"],"current_document_ids":sorted(current_doc_ids),"reused_candidates":len(baseline_fact_rows)})
         valid = [];rejected=[]
         validation_span=start_span(run_id,"fact_validation","validator","事实阶段约束、量纲校验与证据门槛")
         attach_input(validation_span,{"candidates":facts})
@@ -838,10 +858,12 @@ async def execute(run_id, project_id):
             # Historical runs are immutable. Only clear a retry of this exact run.
             conn.execute("DELETE FROM anomalies WHERE run_id=?", (run_id,))
             phases = {d["canonical_phase"] for d in docs}
-            missing = [phase for phase in CANONICAL_PHASES if phase not in phases]
+            expected_phases = list(CANONICAL_PHASES) if action_type=="final_review" else action_snapshot.get("required_phases",[])
+            missing = [phase for phase in expected_phases if phase not in phases]
             if missing and rule_enabled("DOC-001"):
-                insert_anomaly(conn, run_id, project_id, "DOC-001", "全过程资料不完整", rule_severity("DOC-001", "high"),
-                    f"缺少可识别的标准阶段：{'、'.join(missing)}。合并编制的招标/中标、预算/清单资料按一个阶段计入，不要求拆成独立文件。",
+                title="全过程资料不完整" if action_type=="final_review" else "当前业务动作前置资料不完整"
+                insert_anomaly(conn, run_id, project_id, "DOC-001", title, rule_severity("DOC-001", "high"),
+                    f"{action_snapshot.get('action_label','当前审查')}缺少可识别的前置阶段：{'、'.join(missing)}。本结论只按资料截止时间 {run_row.get('cutoff_at') or '本次运行'} 判断，不要求尚未发生的后续阶段资料。",
                     None, 1, [], "deterministic")
                 generated += 1
 
@@ -1101,6 +1123,37 @@ async def execute(run_id, project_id):
             anomaly_count = conn.execute("SELECT COUNT(*) FROM anomalies WHERE run_id=?", (run_id,)).fetchone()[0]
             pending_count = conn.execute("SELECT COUNT(*) FROM anomalies WHERE run_id=? AND status='待复核'", (run_id,)).fetchone()[0]
             high = conn.execute("SELECT COUNT(*) FROM anomalies WHERE run_id=? AND severity='high' AND status='待复核'", (run_id,)).fetchone()[0]
+            current_anomalies=[dict(row) for row in conn.execute("SELECT * FROM anomalies WHERE run_id=? ORDER BY id",(run_id,))]
+            baseline_anomalies=[]
+            if run_row.get("baseline_run_id"):
+                baseline_anomalies=[dict(row) for row in conn.execute("SELECT * FROM anomalies WHERE run_id=? ORDER BY id",(run_row["baseline_run_id"],))]
+            prior_by_key={str(item.get("risk_key") or item["code"]):item for item in baseline_anomalies}
+            current_by_key={};transition_counts={"new":0,"ongoing":0,"resolved":0}
+            for item in current_anomalies:
+                key=str(item.get("risk_key") or item["code"]);prior=prior_by_key.get(key)
+                transition="ongoing" if prior else "new";transition_counts[transition]+=1;current_by_key[key]=item
+                conn.execute("UPDATE anomalies SET risk_key=?,lifecycle_status=?,prior_anomaly_id=? WHERE id=?",
+                             (key,transition,prior["id"] if prior else None,item["id"]))
+                conn.execute("INSERT INTO risk_transitions(run_id,project_id,risk_key,code,transition,prior_anomaly_id,current_anomaly_id,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                             (run_id,project_id,key,item["code"],transition,prior["id"] if prior else None,item["id"],now()))
+            for key,prior in prior_by_key.items():
+                if key in current_by_key:continue
+                transition_counts["resolved"]+=1
+                conn.execute("INSERT INTO risk_transitions(run_id,project_id,risk_key,code,transition,prior_anomaly_id,current_anomaly_id,created_at) VALUES(?,?,?,?,?,?,NULL,?)",
+                             (run_id,project_id,key,prior["code"],"resolved",prior["id"],now()))
+            blocking_codes={code for code,rule in active_rules.items() if int(rule.get("blocking") or 0)}
+            blocking_findings=[item for item in current_anomalies if item["code"] in blocking_codes and item["status"]=="待复核"]
+            if blocking_findings: recommendation,decision_status="暂缓审批","blocked"
+            elif pending_count: recommendation,decision_status="附条件放行","conditional"
+            else: recommendation,decision_status="建议放行","pass"
+            decision={"status":decision_status,"recommendation":recommendation,"action_type":action_type,
+                      "action_label":action_snapshot.get("action_label"),"blocking_count":len(blocking_findings),
+                      "pending_count":pending_count,"risk_transitions":transition_counts,
+                      "cutoff_at":run_row.get("cutoff_at"),"baseline_run_id":run_row.get("baseline_run_id")}
+            conn.execute("UPDATE audit_runs SET decision_json=? WHERE id=?",(json.dumps(decision,ensure_ascii=False),run_id))
+            if run_row.get("action_id"):
+                conn.execute("UPDATE review_actions SET status=?,updated_at=? WHERE id=?",
+                             ("blocked" if blocking_findings else "reviewed",now(),run_row["action_id"]))
             payment_records = records(facts, "payment_record")
             paid,_,_=payment_total(payment_records)
             change_total = sum(num(f["value"].get("amount")) or 0 for f in records(facts, "change_record"))
@@ -1145,7 +1198,8 @@ async def execute(run_id, project_id):
                                         "measurements": len(records(facts, "measurement_record"))},
                       "policy_hits": [{"title": p["title"], "clause": p["clause"], "text": p["text"],
                                        "source": p["source"], "is_template": bool(p["is_template"])} for p in policy_hits],
-                      "ai_summary": ai_summary}
+                       "ai_summary": ai_summary,"review_mode":run_row.get("review_mode"),"action":action_snapshot,
+                       "decision":decision}
             conn.execute("UPDATE audit_runs SET status='completed',finished_at=?,progress=100,current_stage='complete',anomaly_count=?,rule_count=?,result_json=? WHERE id=?",
                          (now(), anomaly_count, len(executable_rules), json.dumps(result, ensure_ascii=False), run_id))
         event(run_id, "complete", "completed", f"真实 AI 审查完成：{len(facts)} 条事实、{anomaly_count} 项待复核事项")

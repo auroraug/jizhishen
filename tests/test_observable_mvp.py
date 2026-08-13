@@ -31,6 +31,7 @@ from backend.app.providers import mineru_local_submit_files
 from backend.app.providers import test_provider_config as probe_provider_config
 from backend.app.model_config import _normalize
 from backend.app.prompt_store import published_prompt, seed_prompts
+from backend.app.review_actions import applicable_rule, normalized_action
 
 
 class MockOpenAIHandler(BaseHTTPRequestHandler):
@@ -157,6 +158,38 @@ class ObservableMVPTests(unittest.TestCase):
         anonymous = self.client.post("/api/providers/test", json={"provider_id": "anonymous"})
         self.assertEqual(anonymous.status_code, 200, anonymous.text)
         self.assertTrue(anonymous.json()["ok"], anonymous.text)
+
+    def test_review_action_catalog_and_gate_run_snapshot(self):
+        catalog=self.client.get("/api/review-actions/catalog")
+        self.assertEqual(catalog.status_code,200,catalog.text)
+        self.assertIn("payment_approval",[item["value"] for item in catalog.json()["actions"]])
+        self.assertEqual(normalized_action("gate","payment_approval"),("gate","payment_approval"))
+        with self.assertRaises(ValueError): normalized_action("gate","final_review")
+        self.assertTrue(applicable_rule({"applicable_actions_json":'["payment_approval"]'},"payment_approval"))
+        self.assertFalse(applicable_rule({"applicable_actions_json":'["contract_signing"]'},"payment_approval"))
+
+        project_id="TEST-GATE-001"
+        created=self.client.post("/api/projects",json={"id":project_id,"name":"付款门禁测试工程","community":"测试社区",
+            "category":"市政工程","budget":1000000,"contract_amount":900000,"status":"施工中","progress":50,"with_demo_materials":False})
+        self.assertEqual(created.status_code,201,created.text)
+        response=self.client.post("/api/documents/upload",data={"project_id":project_id,"doc_type":"结算付款","source_system":"测试"},
+            files={"file":("付款申请.txt","付款编号 FK-01\n付款日期 2026-08-13\n本次支付 100,000元".encode(),"text/plain")})
+        self.assertEqual(response.status_code,200,response.text)
+        document_id=response.json()["document_id"]
+        missing_batch=self.client.post(f"/api/projects/{project_id}/audit",json={"review_mode":"gate","action_type":"payment_approval"})
+        self.assertEqual(missing_batch.status_code,400,missing_batch.text)
+        started=self.client.post(f"/api/projects/{project_id}/audit",json={"review_mode":"gate","action_type":"payment_approval",
+            "current_document_ids":[document_id],"cutoff_at":"2026-08-13T12:00:00"})
+        self.assertEqual(started.status_code,202,started.text)
+        run_id=started.json()["run_id"]
+        with db() as conn:
+            run=conn.execute("SELECT * FROM audit_runs WHERE id=?",(run_id,)).fetchone()
+            role=conn.execute("SELECT document_role FROM audit_run_documents WHERE run_id=?",(run_id,)).fetchone()[0]
+            action=conn.execute("SELECT * FROM review_actions WHERE id=?",(run["action_id"],)).fetchone()
+        self.assertEqual(run["review_mode"],"gate")
+        self.assertEqual(run["cutoff_at"],"2026-08-13 12:00:00")
+        self.assertEqual(action["action_type"],"payment_approval")
+        self.assertEqual(role,"current")
 
     def test_03_full_pipeline_trace_is_real_and_exportable(self):
         created = self.client.post("/api/projects", json={"id": "TEST-TRACE-001", "name": "隔离全链路测试工程",
